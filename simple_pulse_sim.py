@@ -1,9 +1,11 @@
 """Simple pulse simulator (NumPy).
 
-Provides a tiny QubitSim with a Gaussian pulse generator and a simple
-Hadamard-like state maker that includes exponential T2 decay.
+Provides a tiny QubitSim with a Gaussian pulse generator.
+T2 decoherence time is accepted in the constructor and reserved
+for future state-evolution features.
 """
 # typing
+import warnings
 from typing import Tuple, Optional, Union
 import numpy as np
 # optional plotting
@@ -22,36 +24,6 @@ class QubitSim:
             T2: decoherence time in seconds.
         """
         self.T2 = float(T2)
-
-    def gaussian_pulse(self, duration: float = 50e-9, samples: int = 101, sigma: float | None = None) -> Tuple[np.ndarray, np.ndarray]:
-        """Generate a Gaussian pulse with many configurable options.
-
-        Parameters (choice): either supply `sample_rate` or `samples`.
-
-        Args:
-            duration: pulse duration in seconds.
-            sample_rate: samples per second (if provided, overrides `samples`).
-            samples: number of samples (used if sample_rate is None).
-            amplitude: peak amplitude of envelope.
-            sigma: Gaussian sigma in seconds. If None uses duration/6.
-            center: center time (seconds). If None uses duration/2.
-            truncation: truncate tails at ±n_sigma.
-            carrier_freq: carrier frequency in Hz (0 => no carrier).
-            phase: carrier phase in radians.
-            normalize: if True, normalize envelope before applying amplitude.
-            dc_offset: add DC offset to final waveform.
-            drag_alpha: if non-zero, returns complex waveform with DRAG quadrature (alpha * -dA/dt).
-            return_time: if True returns (t, wf) else returns wf only.
-
-        Returns:
-            (t, wf) or wf depending on `return_time`.
-        """
-        # NOTE: keep signature backward-compatible by inferring samples when called with old args
-        raise NotImplementedError
-
-    # backward-compatibility wrapper (keeps old signature behavior)
-    def gaussian_pulse_simple(self, duration: float = 50e-9, samples: int = 101, sigma: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray]:
-        return self.gaussian_pulse(duration=duration, samples=samples, sigma=sigma)
 
     def gaussian_pulse(self,
                        duration: float = 50e-9,
@@ -95,48 +67,65 @@ class QubitSim:
         # envelope (Gaussian, centered at `center`)
         env = np.exp(-((t - float(center)) ** 2) / (2.0 * float(sigma) ** 2))
 
+        # DRAG: compute derivative from smooth (un-truncated) envelope
+        # This avoids step-discontinuity artefacts at the truncation boundary.
+        if abs(drag_alpha) > 1e-12:
+            dt = duration / samples
+            denv = np.gradient(env, dt)
+
         # optional truncation window: zero out outside center +/- truncation*sigma
         if truncation is not None and truncation > 0:
             mask = np.abs(t - float(center)) <= (float(truncation) * float(sigma))
-            env = env * mask.astype(float)
+            env = env * mask
+            if abs(drag_alpha) > 1e-12:
+                denv = denv * mask
 
         # normalize envelope peak to 1 if requested
         if normalize:
             peak = np.max(np.abs(env))
             if peak > 0:
                 env = env / peak
+                if abs(drag_alpha) > 1e-12:
+                    denv = denv / peak
 
-        # apply amplitude and dc offset
+        # apply amplitude scaling
         if amplitude != 1.0:
             env = env * float(amplitude)
-        if dc_offset != 0.0:
-            env = env + float(dc_offset)
+            if abs(drag_alpha) > 1e-12:
+                denv = denv * float(amplitude)
 
-        # DRAG: create complex waveform if requested
+        # build waveform (with DRAG quadrature if requested)
         if abs(drag_alpha) > 1e-12:
-            # derivative of envelope (finite difference)
-            dt = duration / samples
-            denv = np.gradient(env, dt)
-            # DRAG quadrature (commonly -i * alpha * dA/dt)
-            wf = env + 1j * ( - float(drag_alpha) * denv )
+            wf = env + 1j * (-float(drag_alpha) * denv)
         else:
             wf = env
 
-        # carrier modulation (if carrier_freq provided)
-        if carrier_freq and abs(carrier_freq) > 0.0:
-            carrier = np.cos(2.0 * np.pi * float(carrier_freq) * t + float(phase))
-            # if waveform is complex, modulate both real and imag appropriately
+        # carrier modulation
+        if carrier_freq != 0.0:
             if np.iscomplexobj(wf):
                 wf = wf * np.exp(1j * (2.0 * np.pi * float(carrier_freq) * t + float(phase)))
             else:
+                carrier = np.cos(2.0 * np.pi * float(carrier_freq) * t + float(phase))
                 wf = wf * carrier
+        elif phase != 0.0:
+            warnings.warn(
+                f"phase={phase} was set but carrier_freq=0; "
+                "phase has no effect without a carrier."
+            )
+
+        # apply dc offset to final (post-carrier) waveform
+        if dc_offset != 0.0:
+            wf = wf + float(dc_offset)
 
         # cast dtype
         if dtype is not None and dtype is not float:
             try:
                 wf = wf.astype(dtype)
-            except Exception:
-                pass
+            except Exception as exc:
+                warnings.warn(
+                    f"dtype cast to {dtype} failed ({exc}); "
+                    f"returning {wf.dtype} instead."
+                )
 
         if return_time:
             return t, wf
